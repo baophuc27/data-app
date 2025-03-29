@@ -34,6 +34,8 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	implementation 'com.google.code.gson:gson:2.10.1'
 	implementation 'org.codehaus.jackson:jackson-mapper-asl:1.9.13'
+	implementation 'org.springframework.boot:spring-boot-starter-aop'
+	implementation 'net.logstash.logback:logstash-logback-encoder:7.3'
 	implementation 'com.opencsv:opencsv:5.8'
 	compileOnly 'org.projectlombok:lombok'
 	annotationProcessor 'org.projectlombok:lombok'

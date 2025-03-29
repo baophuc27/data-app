@@ -1,6 +1,5 @@
 package com.reeco.bas.transport.application;
 
-
 import com.reeco.bas.transport.infrastructure.KafkaMessageProducer;
 import com.reeco.bas.transport.model.*;
 import com.reeco.bas.transport.utils.annotators.Service;
@@ -23,36 +22,43 @@ public class DataService {
     private long rightSensorTimestamp = System.currentTimeMillis();
     private static final long SENSOR_TIMEOUT_MS = 10000;
 
-    private static final DataProcessor dataProcessor = new DataProcessor();
-
-    private static final CacheStorageService cacheStorageService = new CacheStorageService();
+    @Autowired
+    private DataProcessor dataProcessor;
 
     @Autowired
-    private final ConfigService configService = new ConfigService();
+    private CacheStorageService cacheStorageService;
 
     @Autowired
-    private final MessageService messageService = new MessageService();
+    private ConfigService configService;
 
+    @Autowired
+    private MessageService messageService;
 
+    @Autowired
+    private VesselStateMachine vesselStateMachine;
 
-        public void processData(DataModel dataModel) {
+    public void processData(DataModel dataModel) {
         ConfigModel config = configService.loadConfig();
-	long currentTime = System.currentTimeMillis();
+        long currentTime = System.currentTimeMillis();
 
         if (dataModel.getSensorsType() == SensorsType.LEFT) {
             leftSensorData = dataModel;
-	    leftSensorTimestamp = currentTime;
-	    isLeftTimeout = false;
+            leftSensorTimestamp = currentTime;
+            isLeftTimeout = false;
         } else if (dataModel.getSensorsType() == SensorsType.RIGHT) {
             rightSensorData = dataModel;
-	    rightSensorTimestamp = currentTime;
-	    isRightTimeout = false;
+            rightSensorTimestamp = currentTime;
+            isRightTimeout = false;
         }
-	try {
+
+        try {
             if (shouldProcessData(currentTime) && config.getBerthId() == 1) {
                 // Handle timeout cases by copying data
                 handleSensorTimeout(currentTime);
                 processAndSendCombinedData(config);
+
+                // Update vessel state machine with latest sensor data
+                updateVesselStateMachine();
             }
         } finally {
             // Only clear the data after successful processing or if both sensors have timed out
@@ -61,37 +67,63 @@ public class DataService {
                 rightSensorData = null;
             }
         }
-	
-        log.info(String.valueOf(rightSensorTimestamp - currentTime));
-	}
-            private boolean shouldProcessData(long currentTime) {
+
+        log.debug("Sensor timestamp difference: {}", rightSensorTimestamp - currentTime);
+    }
+
+    private void updateVesselStateMachine() {
+        if (leftSensorData == null || rightSensorData == null) {
+            return;
+        }
+
+        // Process and transform data for the state machine
+        double leftDistance = leftSensorData.getDistance();
+        double rightDistance = rightSensorData.getDistance();
+        double leftSpeed = leftSensorData.getSpeed() * 100;  // Convert to cm/s
+        double rightSpeed = rightSensorData.getSpeed() * 100;  // Convert to cm/s
+
+        // Determine if targets are lost
+        boolean leftTargetLost = leftSensorData.getError_code() == 1011;
+        boolean rightTargetLost = rightSensorData.getError_code() == 1012;
+
+        // Update the state machine with current sensor data
+        vesselStateMachine.updateSensorData(
+                leftDistance,
+                rightDistance,
+                leftSpeed,
+                rightSpeed,
+                leftTargetLost,
+                rightTargetLost
+        );
+    }
+
+    // Existing methods remain unchanged
+    private boolean shouldProcessData(long currentTime) {
         // Process if both sensors have data and at least one is recent
         return (leftSensorData != null && rightSensorData != null) ||
-               (hasTimedOut(currentTime, leftSensorTimestamp) || 
-                hasTimedOut(currentTime, rightSensorTimestamp));
+                (hasTimedOut(currentTime, leftSensorTimestamp) ||
+                        hasTimedOut(currentTime, rightSensorTimestamp));
     }
 
     private boolean shouldClearData(long currentTime) {
         // Clear data if both sensors are present and processed, or both have timed out
         return (leftSensorData != null && rightSensorData != null) ||
-               (hasTimedOut(currentTime, leftSensorTimestamp) && 
-                hasTimedOut(currentTime, rightSensorTimestamp));
+                (hasTimedOut(currentTime, leftSensorTimestamp) &&
+                        hasTimedOut(currentTime, rightSensorTimestamp));
     }
 
     private void handleSensorTimeout(long currentTime) {
         // If left sensor timed out but right is recent, copy right to left
-        if (hasTimedOut(currentTime, leftSensorTimestamp) && 
-            isDataRecent(currentTime, rightSensorTimestamp)) {
+        if (hasTimedOut(currentTime, leftSensorTimestamp) &&
+                isDataRecent(currentTime, rightSensorTimestamp)) {
             leftSensorData = rightSensorData;
-            //leftSensorTimestamp = rightSensorTimestamp;
-	    isLeftTimeout = true;
+            isLeftTimeout = true;
         }
         // If right sensor timed out but left is recent, copy left to right
-        else if (hasTimedOut(currentTime, rightSensorTimestamp) && 
-                 isDataRecent(currentTime, leftSensorTimestamp)) {
+        else if (hasTimedOut(currentTime, rightSensorTimestamp) &&
+                isDataRecent(currentTime, leftSensorTimestamp)) {
             rightSensorData = leftSensorData;
-            // rightSensorTimestamp = leftSensorTimestamp;
-	    isRightTimeout = true;
+            isRightTimeout = true;
         }
     }
 
@@ -104,10 +136,10 @@ public class DataService {
     }
 
     private void processAndSendCombinedData(ConfigModel config) {
-        if (config.getMode().equals("stop")){
-            cacheStorageService.exportAndClear(config.getOrgId(),config.getBerthId(),config.getSessionId());
+        if ("stop".equals(config.getMode())) {
+            cacheStorageService.exportAndClear(config.getOrgId(), config.getBerthId(), config.getSessionId());
         }
-        else{
+        else {
             double leftSpeed = leftSensorData.getSpeed() * 100;
             double rightSpeed = rightSensorData.getSpeed() * 100;
 
@@ -126,13 +158,13 @@ public class DataService {
             double rightDistanceToFender = lastValidRightDistance - config.getDistanceRightSensorToFender();
 
             // Calculate angle
-            double angle = dataProcessor.calculateAngle(leftDistanceToFender,rightDistanceToFender,config.getDistanceBetweenFender());
+            double angle = dataProcessor.calculateAngle(leftDistanceToFender, rightDistanceToFender, config.getDistanceBetweenFender());
 
-            String leftZone = dataProcessor.getZone(leftDistanceToFender,config);
-            String rightZone = dataProcessor.getZone(rightDistanceToFender,config);
+            String leftZone = dataProcessor.getZone(leftDistanceToFender, config);
+            String rightZone = dataProcessor.getZone(rightDistanceToFender, config);
 
             CombinedData combinedData = dataProcessor.createCombinedData(angle, leftZone, rightZone,
-                    leftDistanceToFender, rightDistanceToFender, leftSpeed, rightSpeed,config);
+                    leftDistanceToFender, rightDistanceToFender, leftSpeed, rightSpeed, config);
 
             ErrorCodePair errorPair = mergeErrorCode(
                     leftSensorData.getError_code(),
@@ -141,30 +173,28 @@ public class DataService {
             combinedData.setError_code(errorPair.getError_code());
             combinedData.setError_msg(errorPair.getError_message());
 
-	    if (isLeftTimeout){
-	    combinedData = deleteSSData(combinedData,true,false);
-	    combinedData.setError_code(1031);
-	    }
-	    if (isRightTimeout){
-	    combinedData = deleteSSData(combinedData,false,true);
-	    combinedData.setError_code(1032);
-	    }
+            if (isLeftTimeout) {
+                combinedData = deleteSSData(combinedData, true, false);
+                combinedData.setError_code(1031);
+            }
+            if (isRightTimeout) {
+                combinedData = deleteSSData(combinedData, false, true);
+                combinedData.setError_code(1032);
+            }
 
-        messageService.sendProcessedDataRecord(combinedData);
-        log.info("[PROCESSED DATA]: "+combinedData.toString());
-	    try{
-            SyncPayload syncPayload = dataProcessor.mappingCombinedDataToSyncPayload(combinedData);
-            cacheStorageService.addItem(syncPayload);
-	    }
-	    catch (Exception e){
-	    log.error("Failed to process and cache sync payload. combinedData: {}", combinedData, e);
-	    }
+            messageService.sendProcessedDataRecord(combinedData);
+            log.info("[PROCESSED DATA]: {}", combinedData);
+
+            try {
+                SyncPayload syncPayload = dataProcessor.mappingCombinedDataToSyncPayload(combinedData);
+                cacheStorageService.addItem(syncPayload);
+            } catch (Exception e) {
+                log.error("Failed to process and cache sync payload. combinedData: {}", combinedData, e);
+            }
         }
-
-
     }
 
-
+    // Existing helper methods remain unchanged
     private ErrorCodePair mergeErrorCode(int errorCode1, int errorCode2) {
         if (errorCode1 == 1011 && errorCode2 == 0) {
             return new ErrorCodePair(1011, "Left sensor out of target");
@@ -188,8 +218,8 @@ public class DataService {
 
         return new ErrorCodePair(0, "");
     }
-    private CombinedData deleteSSData(CombinedData data, boolean deleteSS01, boolean deleteSS02) {
 
+    private CombinedData deleteSSData(CombinedData data, boolean deleteSS01, boolean deleteSS02) {
         if (deleteSS01) {
             data.getDistance().setSs01(null);
             data.getSpeed().setSs01(null);
@@ -197,18 +227,8 @@ public class DataService {
         if (deleteSS02) {
             data.getDistance().setSs02(null);
             data.getSpeed().setSs02(null);
-       }
+        }
         data.setAngle(null);
         return data;
     }
-//
-//    private List<Integer> extractStatusIds(CombinedData data) {
-//        List<Integer> statusIds = new ArrayList<>();
-//        statusIds.add(data.getAngle().getStatusId());
-//        statusIds.add(data.getDistance().getSs01().getStatusId());
-//        statusIds.add(data.getDistance().getSs02().getStatusId());
-//        statusIds.add(data.getSpeed().getSs01().getStatusId());
-//        statusIds.add(data.getSpeed().getSs02().getStatusId());
-//        return statusIds;
-//    }
 }
