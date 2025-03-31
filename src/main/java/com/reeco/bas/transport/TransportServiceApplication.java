@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
+import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -24,7 +25,9 @@ public class TransportServiceApplication {
 	private VesselStateMachine vesselStateMachine;
 
 	public static void main(String[] args) {
-		ConfigurableApplicationContext context = SpringApplication.run(TransportServiceApplication.class, args);
+		SpringApplication app = new SpringApplication(TransportServiceApplication.class);
+		app.setWebApplicationType(WebApplicationType.NONE); // Set to NONE to disable web server
+		ConfigurableApplicationContext context = app.run(args);
 		Environment env = context.getEnvironment();
 		myVariable = env.getProperty("my.variable");
 		System.out.println("Env var: " + myVariable);
