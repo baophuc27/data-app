@@ -257,22 +257,23 @@ public class CacheStorageService {
         log.info("Cleared {} items from cache", size);
     }
     private void sendToApi(List<SyncPayload> payloads) {
-        try {
-            ResponseEntity<String> response = restTemplate.postForEntity(
-                    API_URL,
-                    payloads,
-                    String.class
-            );
-
-            if (response.getStatusCode().is2xxSuccessful()) {
-                System.out.println("Successfully synced " + payloads.size() + " records");
-            } else {
-                System.err.println("Failed to sync data. Status code: " + response.getStatusCode());
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-            log.warn("Failed to send data to API: " + e.getMessage());
-        }
+        return;
+//        try {
+//            ResponseEntity<String> response = restTemplate.postForEntity(
+//                    API_URL,
+//                    payloads,
+//                    String.class
+//            );
+//
+//            if (response.getStatusCode().is2xxSuccessful()) {
+//                System.out.println("Successfully synced " + payloads.size() + " records");
+//            } else {
+//                System.err.println("Failed to sync data. Status code: " + response.getStatusCode());
+//            }
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//            log.warn("Failed to send data to API: " + e.getMessage());
+//        }
     }
     /**
      * Get all items without removing them

@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import jakarta.annotation.PostConstruct;
 
 @Service
 @Slf4j
@@ -54,6 +55,39 @@ public class VesselStateMachine {
     private Instant stateChangeTime = Instant.now();
     private Instant conditionMetTime = null;
 
+    // Track the last known mode to detect changes
+    private String lastKnownMode = null;
+
+    @PostConstruct
+    public void initialize() {
+        try {
+            ConfigModel config = configService.loadConfig();
+            if (config != null) {
+                VesselState initialState = determineStateFromMode(config.getMode());
+                initializeWithState(initialState);
+                log.info("Initialized vessel state to {} based on config mode '{}'", initialState, config.getMode());
+                lastKnownMode = config.getMode();
+            } else {
+                log.warn("Could not load configuration during initialization, defaulting to AVAILABLE state");
+            }
+        } catch (Exception e) {
+            log.error("Error during vessel state initialization", e);
+        }
+    }
+
+    private VesselState determineStateFromMode(String mode) {
+        if (mode == null) {
+            return VesselState.AVAILABLE;
+        }
+
+        return switch (mode) {
+            case "start" -> VesselState.BERTHING;
+            case "start-mooring" -> VesselState.MOORING;
+            case "departing" -> VesselState.DEPARTING;
+            default -> VesselState.AVAILABLE;
+        };
+    }
+
     public void initializeWithState(VesselState initialState) {
         if (currentState != initialState) {
             log.info("Initializing vessel state machine with state: {}", initialState);
@@ -70,14 +104,29 @@ public class VesselStateMachine {
     @Scheduled(fixedDelayString = "${vessel.transition.check.interval:5000}")
     public void checkForStateTransition() {
         ConfigModel config = configService.loadConfig();
-        if (config == null || "stop".equals(config.getMode())) {
+        if (config == null) {
+            return;
+        }
+
+        String currentMode = config.getMode();
+        boolean modeChanged = !currentMode.equals(lastKnownMode);
+
+        // Handle mode-based state transitions
+        if (modeChanged) {
+            handleModeBasedTransition(currentMode);
+        }
+
+        // Update the last known mode
+        lastKnownMode = currentMode;
+
+        // Skip further processing if mode is "stop"
+        if ("stop".equals(currentMode)) {
             return;
         }
 
         switch (currentState) {
             case AVAILABLE:
-                // No automatic transition from AVAILABLE
-                // This is triggered by user input
+                // Automatic transition from AVAILABLE to BERTHING handled in handleModeBasedTransition
                 break;
 
             case BERTHING:
@@ -94,12 +143,29 @@ public class VesselStateMachine {
         }
     }
 
+    private void handleModeBasedTransition(String newMode) {
+        log.info("Mode changed to '{}'. Current state: {}", newMode, currentState);
+
+        VesselState targetState = determineStateFromMode(newMode);
+        if (targetState != currentState) {
+            log.info("Mode '{}' indicates state should be {}. Transitioning from {}",
+                    newMode, targetState, currentState);
+            transitionState(targetState);
+        }
+    }
+
     private void checkBerthingToMooringTransition() {
         // Get latest sensor data from context
-        Double leftDistance = (Double) stateContext.getOrDefault("leftDistance", Double.MAX_VALUE);
-        Double rightDistance = (Double) stateContext.getOrDefault("rightDistance", Double.MAX_VALUE);
-        Double leftSpeed = (Double) stateContext.getOrDefault("leftSpeed", Double.MAX_VALUE);
-        Double rightSpeed = (Double) stateContext.getOrDefault("rightSpeed", Double.MAX_VALUE);
+        Double leftDistance = (Double) stateContext.getOrDefault("leftDistance", null);
+        Double rightDistance = (Double) stateContext.getOrDefault("rightDistance", null);
+        Double leftSpeed = (Double) stateContext.getOrDefault("leftSpeed", null);
+        Double rightSpeed = (Double) stateContext.getOrDefault("rightSpeed", null);
+
+        // Skip if we don't have valid data yet
+        if (leftDistance == null || rightDistance == null || leftSpeed == null || rightSpeed == null) {
+            log.debug("Skipping berthing check - incomplete sensor data");
+            return;
+        }
 
         double minDistance = Math.min(leftDistance, rightDistance);
         double maxSpeed = Math.max(Math.abs(leftSpeed), Math.abs(rightSpeed));
@@ -127,16 +193,26 @@ public class VesselStateMachine {
 
     private void checkMooringToDepartingTransition() {
         // Get latest sensor data from context
+        Double currentLeftDistance = (Double) stateContext.getOrDefault("leftDistance", null);
+        Double currentRightDistance = (Double) stateContext.getOrDefault("rightDistance", null);
+
+        // Skip if we don't have valid sensor data yet
+        if (currentLeftDistance == null || currentRightDistance == null) {
+            log.debug("MOORING->DEPARTING: Skipping check - waiting for valid sensor data");
+            return;
+        }
+
+        // Get reference distances, might be null if not set yet
         Double initialLeftDistance = (Double) stateContext.getOrDefault("initialLeftDistance", null);
         Double initialRightDistance = (Double) stateContext.getOrDefault("initialRightDistance", null);
-        Double currentLeftDistance = (Double) stateContext.getOrDefault("leftDistance", Double.MAX_VALUE);
-        Double currentRightDistance = (Double) stateContext.getOrDefault("rightDistance", Double.MAX_VALUE);
 
         // Initialize reference distances if not set
         if (initialLeftDistance == null || initialRightDistance == null) {
             stateContext.put("initialLeftDistance", currentLeftDistance);
             stateContext.put("initialRightDistance", currentRightDistance);
             stateContext.put("distanceCheckStartTime", Instant.now());
+            log.debug("MOORING->DEPARTING: Initial reference distances set. Left: {}, Right: {}",
+                    currentLeftDistance, currentRightDistance);
             return;
         }
 
@@ -144,9 +220,22 @@ public class VesselStateMachine {
         boolean leftMoving = currentLeftDistance - initialLeftDistance >= departingStartDistance;
         boolean rightMoving = currentRightDistance - initialRightDistance >= departingStartDistance;
 
+        // Enhanced debug logging
+        log.debug("MOORING->DEPARTING Check: Initial [L:{}, R:{}], Current [L:{}, R:{}], Changes [L:{}, R:{}], " +
+                        "Thresholds [Min distance change: {}, Min time: {}s], Moving? [Left: {}, Right: {}]",
+                initialLeftDistance, initialRightDistance,
+                currentLeftDistance, currentRightDistance,
+                currentLeftDistance - initialLeftDistance,
+                currentRightDistance - initialRightDistance,
+                departingStartDistance, departingStartTimeSeconds,
+                leftMoving, rightMoving);
+
         if (leftMoving || rightMoving) {
             Instant checkStartTime = (Instant) stateContext.get("distanceCheckStartTime");
             long elapsedSeconds = Instant.now().getEpochSecond() - checkStartTime.getEpochSecond();
+
+            log.debug("MOORING->DEPARTING: Significant movement detected. Time elapsed: {}s/{} required",
+                    elapsedSeconds, departingStartTimeSeconds);
 
             if (elapsedSeconds >= departingStartTimeSeconds) {
                 log.info("Transition condition met: MOORING -> DEPARTING (distance change >= {}, time >= {}s)",
@@ -155,11 +244,23 @@ public class VesselStateMachine {
             }
         } else {
             // Update reference values periodically to handle small movements
-            if (Instant.now().getEpochSecond() - ((Instant) stateContext.get("distanceCheckStartTime")).getEpochSecond() > 300) {
+            Instant checkStartTime = (Instant) stateContext.get("distanceCheckStartTime");
+            if (checkStartTime == null) {
+                checkStartTime = Instant.now();
+                stateContext.put("distanceCheckStartTime", checkStartTime);
+                log.debug("MOORING->DEPARTING: Initialized check start time");
+            }
+
+            long timeSinceLastUpdate = Instant.now().getEpochSecond() - checkStartTime.getEpochSecond();
+
+            if (timeSinceLastUpdate > 300) {
+                log.debug("MOORING->DEPARTING: Updating reference distances after {}s. Old [L:{}, R:{}], New [L:{}, R:{}]",
+                        timeSinceLastUpdate, initialLeftDistance, initialRightDistance,
+                        currentLeftDistance, currentRightDistance);
+
                 stateContext.put("initialLeftDistance", currentLeftDistance);
                 stateContext.put("initialRightDistance", currentRightDistance);
                 stateContext.put("distanceCheckStartTime", Instant.now());
-                log.debug("Updated reference distances for mooring state");
             }
         }
     }
@@ -192,6 +293,13 @@ public class VesselStateMachine {
 
     public void updateSensorData(double leftDistance, double rightDistance, double leftSpeed, double rightSpeed,
                                  boolean leftTargetLost, boolean rightTargetLost) {
+        // Log when initial sensor data is received in MOORING state
+        if (currentState == VesselState.MOORING &&
+                !stateContext.containsKey("leftDistance") &&
+                !stateContext.containsKey("rightDistance")) {
+            log.info("MOORING: First sensor data received: Left: {}m, Right: {}m", leftDistance, rightDistance);
+        }
+
         stateContext.put("leftDistance", leftDistance);
         stateContext.put("rightDistance", rightDistance);
         stateContext.put("leftSpeed", leftSpeed);
@@ -237,6 +345,12 @@ public class VesselStateMachine {
 
         stateContext.clear();
         stateContext.putAll(sensorData);
+
+        // Special handling for MOORING state entry: reset initial distances
+        if (newState == VesselState.MOORING) {
+            // Clear initial references so they get reset with the next sensor data
+            log.debug("MOORING state entered. Reference distances will be initialized with next sensor readings.");
+        }
 
         // Notify about state transition
         VesselStateTransition transition = new VesselStateTransition(dataAppCode, oldState, newState);

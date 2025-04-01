@@ -23,10 +23,10 @@ import java.time.LocalDateTime;
 @Slf4j
 public class DeviceHandler {
 
-    @Value("ttyS0")
+    @Value("ttyS2")
     private String LEFT_SENSOR_PORT;
 
-    @Value("ttyS1")
+    @Value("ttyS3")
     private String RIGHT_SENSOR_PORT;
 
     @Value("${data.organization-id}")
