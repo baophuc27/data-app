@@ -130,11 +130,11 @@ public class VesselStateMachine {
                 break;
 
             case BERTHING:
-                checkBerthingToMooringTransition();
+                checkBerthingToMooringTransition(config);
                 break;
 
             case MOORING:
-                checkMooringToDepartingTransition();
+                checkMooringToDepartingTransition(config);
                 break;
 
             case DEPARTING:
@@ -154,112 +154,135 @@ public class VesselStateMachine {
         }
     }
 
-    private void checkBerthingToMooringTransition() {
-        // Get latest sensor data from context
+    private void checkBerthingToMooringTransition(ConfigModel config) {
+        // Get latest sensor data from context including target lost status
         Double leftDistance = (Double) stateContext.getOrDefault("leftDistance", null);
         Double rightDistance = (Double) stateContext.getOrDefault("rightDistance", null);
         Double leftSpeed = (Double) stateContext.getOrDefault("leftSpeed", null);
         Double rightSpeed = (Double) stateContext.getOrDefault("rightSpeed", null);
+        Boolean leftTargetLost = (Boolean) stateContext.getOrDefault("leftTargetLost", false);
+        Boolean rightTargetLost = (Boolean) stateContext.getOrDefault("rightTargetLost", false);
 
         // Skip if we don't have valid data yet
         if (leftDistance == null || rightDistance == null || leftSpeed == null || rightSpeed == null) {
-            log.debug("Skipping berthing check - incomplete sensor data");
             return;
         }
 
-        double minDistance = Math.min(leftDistance, rightDistance);
-        double maxSpeed = Math.max(Math.abs(leftSpeed), Math.abs(rightSpeed));
+        // Skip transition check if both sensors have target loss (error codes 1011/1012)
+        if (leftTargetLost && rightTargetLost) {
+            return;
+        }
+
+        // Calculate distances relative to fender
+        double leftDistanceToFender = leftDistance - config.getDistanceLeftSensorToFender();
+        double rightDistanceToFender = rightDistance - config.getDistanceRightSensorToFender();
+
+        // Calculate using valid sensor data, using 0 for sensors with target loss
+        double minDistance;
+        double maxSpeed;
+        
+        if (leftTargetLost && !rightTargetLost) {
+            // Only right sensor is valid
+            minDistance = rightDistanceToFender;
+            maxSpeed = Math.abs(rightSpeed);
+        } else if (!leftTargetLost && rightTargetLost) {
+            // Only left sensor is valid
+            minDistance = leftDistanceToFender;
+            maxSpeed = Math.abs(leftSpeed);
+        } else {
+            // Both sensors are valid
+            minDistance = Math.min(leftDistanceToFender, rightDistanceToFender);
+            maxSpeed = Math.max(Math.abs(leftSpeed), Math.abs(rightSpeed));
+        }
 
         if (minDistance < berthingCompleteDistance && maxSpeed < berthingCompleteSpeed) {
             if (conditionMetTime == null) {
                 conditionMetTime = Instant.now();
-                log.debug("Berthing completion condition first met at {}", conditionMetTime);
+                if (log.isDebugEnabled()) {
+                    log.debug("Berthing completion condition first met at {}", conditionMetTime);
+                }
             } else {
                 long elapsedSeconds = Instant.now().getEpochSecond() - conditionMetTime.getEpochSecond();
                 if (elapsedSeconds >= berthingCompleteTimeSeconds) {
-                    log.info("Transition condition met: BERTHING -> MOORING (distance < {}, speed < {}, time >= {}s)",
+                    log.info("Transition: BERTHING -> MOORING (distance < {}, speed < {}, time >= {}s)",
                             berthingCompleteDistance, berthingCompleteSpeed, berthingCompleteTimeSeconds);
                     transitionState(VesselState.MOORING);
                 }
             }
-        } else {
+        } else if (conditionMetTime != null) {
             // Reset the timer if conditions are no longer met
-            if (conditionMetTime != null) {
-                log.debug("Berthing completion conditions no longer met. Resetting timer.");
-                conditionMetTime = null;
-            }
+            conditionMetTime = null;
         }
     }
 
-    private void checkMooringToDepartingTransition() {
+    private void checkMooringToDepartingTransition(ConfigModel config) {
         // Get latest sensor data from context
-        Double currentLeftDistance = (Double) stateContext.getOrDefault("leftDistance", null);
-        Double currentRightDistance = (Double) stateContext.getOrDefault("rightDistance", null);
+        Double leftDistance = (Double) stateContext.getOrDefault("leftDistance", null);
+        Double rightDistance = (Double) stateContext.getOrDefault("rightDistance", null);
+        Boolean leftTargetLost = (Boolean) stateContext.getOrDefault("leftTargetLost", false);
+        Boolean rightTargetLost = (Boolean) stateContext.getOrDefault("rightTargetLost", false);
 
         // Skip if we don't have valid sensor data yet
-        if (currentLeftDistance == null || currentRightDistance == null) {
-            log.debug("MOORING->DEPARTING: Skipping check - waiting for valid sensor data");
+        if (leftDistance == null || rightDistance == null) {
             return;
         }
 
+        // Calculate distances relative to fender
+        double leftDistanceToFender = leftDistance - config.getDistanceLeftSensorToFender();
+        double rightDistanceToFender = rightDistance - config.getDistanceRightSensorToFender();
+
         // Get reference distances, might be null if not set yet
-        Double initialLeftDistance = (Double) stateContext.getOrDefault("initialLeftDistance", null);
-        Double initialRightDistance = (Double) stateContext.getOrDefault("initialRightDistance", null);
+        Double initialLeftFenderDistance = (Double) stateContext.getOrDefault("initialLeftFenderDistance", null);
+        Double initialRightFenderDistance = (Double) stateContext.getOrDefault("initialRightFenderDistance", null);
+        Instant movementDetectionStartTime = (Instant) stateContext.getOrDefault("movementDetectionStartTime", null);
 
         // Initialize reference distances if not set
-        if (initialLeftDistance == null || initialRightDistance == null) {
-            stateContext.put("initialLeftDistance", currentLeftDistance);
-            stateContext.put("initialRightDistance", currentRightDistance);
+        if (initialLeftFenderDistance == null || initialRightFenderDistance == null) {
+            stateContext.put("initialLeftFenderDistance", leftDistanceToFender);
+            stateContext.put("initialRightFenderDistance", rightDistanceToFender);
             stateContext.put("distanceCheckStartTime", Instant.now());
-            log.debug("MOORING->DEPARTING: Initial reference distances set. Left: {}, Right: {}",
-                    currentLeftDistance, currentRightDistance);
+            stateContext.put("movementDetectionStartTime", null); // No movement detected yet
             return;
         }
 
         // Check if either sensor shows significant movement
-        boolean leftMoving = currentLeftDistance - initialLeftDistance >= departingStartDistance;
-        boolean rightMoving = currentRightDistance - initialRightDistance >= departingStartDistance;
-
-        // Enhanced debug logging
-        log.debug("MOORING->DEPARTING Check: Initial [L:{}, R:{}], Current [L:{}, R:{}], Changes [L:{}, R:{}], " +
-                        "Thresholds [Min distance change: {}, Min time: {}s], Moving? [Left: {}, Right: {}]",
-                initialLeftDistance, initialRightDistance,
-                currentLeftDistance, currentRightDistance,
-                currentLeftDistance - initialLeftDistance,
-                currentRightDistance - initialRightDistance,
-                departingStartDistance, departingStartTimeSeconds,
-                leftMoving, rightMoving);
+        boolean leftMoving = !leftTargetLost && (leftDistanceToFender - initialLeftFenderDistance >= departingStartDistance);
+        boolean rightMoving = !rightTargetLost && (rightDistanceToFender - initialRightFenderDistance >= departingStartDistance);
 
         if (leftMoving || rightMoving) {
-            Instant checkStartTime = (Instant) stateContext.get("distanceCheckStartTime");
-            long elapsedSeconds = Instant.now().getEpochSecond() - checkStartTime.getEpochSecond();
+            if (movementDetectionStartTime == null) {
+                // Start tracking continuous movement
+                movementDetectionStartTime = Instant.now();
+                stateContext.put("movementDetectionStartTime", movementDetectionStartTime);
+                if (log.isDebugEnabled()) {
+                    log.debug("MOORING->DEPARTING: Movement detection started");
+                }
+            }
 
-            log.debug("MOORING->DEPARTING: Significant movement detected. Time elapsed: {}s/{} required",
-                    elapsedSeconds, departingStartTimeSeconds);
+            long elapsedSeconds = Instant.now().getEpochSecond() - movementDetectionStartTime.getEpochSecond();
 
             if (elapsedSeconds >= departingStartTimeSeconds) {
-                log.info("Transition condition met: MOORING -> DEPARTING (distance change >= {}, time >= {}s)",
+                log.info("Transition: MOORING -> DEPARTING (fender distance change >= {}, time >= {}s)",
                         departingStartDistance, departingStartTimeSeconds);
                 transitionState(VesselState.DEPARTING);
             }
+        } else if (movementDetectionStartTime != null) {
+            // If neither sensor is showing sufficient movement, reset the movement detection timer
+            stateContext.put("movementDetectionStartTime", null);
         } else {
-            // Update reference values periodically to handle small movements
+            // Check if we should update reference values due to small movements or elapsed time
             Instant checkStartTime = (Instant) stateContext.get("distanceCheckStartTime");
             if (checkStartTime == null) {
                 checkStartTime = Instant.now();
                 stateContext.put("distanceCheckStartTime", checkStartTime);
-                log.debug("MOORING->DEPARTING: Initialized check start time");
             }
 
             long timeSinceLastUpdate = Instant.now().getEpochSecond() - checkStartTime.getEpochSecond();
 
+            // Only update reference distances if significant time has passed
             if (timeSinceLastUpdate > 300) {
-                log.debug("MOORING->DEPARTING: Updating reference distances after {}s. Old [L:{}, R:{}], New [L:{}, R:{}]",
-                        timeSinceLastUpdate, initialLeftDistance, initialRightDistance,
-                        currentLeftDistance, currentRightDistance);
-
-                stateContext.put("initialLeftDistance", currentLeftDistance);
-                stateContext.put("initialRightDistance", currentRightDistance);
+                stateContext.put("initialLeftFenderDistance", leftDistanceToFender);
+                stateContext.put("initialRightFenderDistance", rightDistanceToFender);
                 stateContext.put("distanceCheckStartTime", Instant.now());
             }
         }
@@ -273,21 +296,20 @@ public class VesselStateMachine {
         if (leftTargetLost && rightTargetLost) {
             if (conditionMetTime == null) {
                 conditionMetTime = Instant.now();
-                log.debug("Departing completion condition first met at {}", conditionMetTime);
+                if (log.isDebugEnabled()) {
+                    log.debug("Departing completion condition first met at {}", conditionMetTime);
+                }
             } else {
                 long elapsedSeconds = Instant.now().getEpochSecond() - conditionMetTime.getEpochSecond();
                 if (elapsedSeconds >= departingCompleteTimeSeconds) {
-                    log.info("Transition condition met: DEPARTING -> AVAILABLE (both targets lost for >= {}s)",
+                    log.info("Transition: DEPARTING -> AVAILABLE (both targets lost for >= {}s)",
                             departingCompleteTimeSeconds);
                     transitionState(VesselState.AVAILABLE);
                 }
             }
-        } else {
+        } else if (conditionMetTime != null) {
             // Reset the timer if conditions are no longer met
-            if (conditionMetTime != null) {
-                log.debug("Departing completion conditions no longer met. Resetting timer.");
-                conditionMetTime = null;
-            }
+            conditionMetTime = null;
         }
     }
 
@@ -346,19 +368,11 @@ public class VesselStateMachine {
         stateContext.clear();
         stateContext.putAll(sensorData);
 
-        // Special handling for MOORING state entry: reset initial distances
-        if (newState == VesselState.MOORING) {
-            // Clear initial references so they get reset with the next sensor data
-            log.debug("MOORING state entered. Reference distances will be initialized with next sensor readings.");
-        }
-
         // Notify about state transition
         VesselStateTransition transition = new VesselStateTransition(dataAppCode, oldState, newState);
         boolean success = transitionApiService.notifyStateTransition(transition);
 
-        if (success) {
-            log.info("Successfully notified state transition: {} -> {}", oldState, newState);
-        } else {
+        if (!success) {
             log.error("Failed to notify state transition: {} -> {}", oldState, newState);
         }
     }
